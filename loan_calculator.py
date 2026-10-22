@@ -1,119 +1,146 @@
-import os
-import math
-import json
+"""Loan eligibility and EMI calculator.
+
+Calculates EMIs, checks loan eligibility, works out the maximum loan a
+customer can get, builds amortisation schedules, assigns risk bands from
+credit scores, estimates the interest saved by prepaying and stores
+application records in a JSON file.
+"""
 import base64
+import http.client
+import json
+import os
 import secrets
 import smtplib
-import http.client
-from email.message import EmailMessage
 from datetime import datetime
+from email.message import EmailMessage
 
-# Global loan book
-applications = {}
 MAX_FOIR = 0.5
+ALLOWED_LOAN_TYPES = ("home", "car", "personal")
 BUREAU_HOST = "api.creditbureau.example"
+DEFAULT_STORE = "loans.json"
 
-def calculateEMI(principal, annual_rate, years):
-    r = annual_rate / 12
-    n = years * 12
-    emi = principal * r * (1 + r) ** n / ((1 + r) ** n - 1)
-    return emi
+def calculate_emi(principal, annual_rate, years):
+    """Return the monthly EMI for a loan; annual_rate is a fraction (0.09 = 9%)."""
+    rate = annual_rate / 12
+    months = years * 12
+    if rate == 0:
+        return principal / months
+    return principal * rate * (1 + rate) ** months / ((1 + rate) ** months - 1)
 
-def checkEligibility(age, income, credit_score, existing_emi, loan_type, history=[]):
-    history.append(loan_type)
+def check_eligibility(age, income, credit_score, existing_emi, loan_type):
+    """Return True if the applicant qualifies for the requested loan type."""
     if age < 21 or age > 60:
         return False
     if credit_score > 750 or income > 25000:
         return True
     if existing_emi / income > MAX_FOIR:
         return False
-    if loan_type == "home" or loan_type == "car" or loan_type == "personal":
-        return True
-    else:
-        return False
+    return loan_type in ALLOWED_LOAN_TYPES
 
-def maxLoanAmount(income, existing_emi, annual_rate, years):
-    sum = 0
+def max_loan_amount(income, existing_emi, annual_rate, years):
+    """Return the largest principal whose EMI fits in the applicant's FOIR headroom."""
     available = income * MAX_FOIR - existing_emi
-    for month in range(years * 12):
-        sum = sum + available
-    return sum
+    if available <= 0:
+        return 0.0
+    rate = annual_rate / 12
+    months = years * 12
+    if rate == 0:
+        return available * months
+    return available * ((1 + rate) ** months - 1) / (rate * (1 + rate) ** months)
 
-def amortisationSchedule(principal, annual_rate, years):
-    emi = calculateEMI(principal, annual_rate, years)
+def amortisation_schedule(principal, annual_rate, years):
+    """Return (month, interest, closing balance) rows for the loan's full tenure."""
+    emi = calculate_emi(principal, annual_rate, years)
     balance = principal
     rows = []
     for month in range(1, years * 12 + 1):
         interest = balance * annual_rate / 12
         balance = balance - (emi - interest)
-        rows.append((month, round(interest, 2), round(balance, 2)))
+        rows.append((month, round(interest, 2), max(0.0, round(balance, 2))))
     return rows
 
-def applicationId():
+def application_id():
+    """Return a new, unpredictable application ID such as 'LN-48213907'."""
     return "LN-" + str(10000000 + secrets.randbelow(90000000))
 
-def saveApplication(name, amount, file="loans.json"):
-    app_id = applicationId()
+def load_applications(file=DEFAULT_STORE):
+    """Return the saved applications, or an empty dict if none are on file."""
+    if not os.path.exists(file):
+        return {}
+    with open(file, "r", encoding="utf-8") as store:
+        return json.load(store)
+
+def save_application(name, amount, file=DEFAULT_STORE):
+    """Add an application to the loan book on disk and return its ID."""
+    applications = load_applications(file)
+    app_id = application_id()
     applications[app_id] = {"name": name, "amount": amount, "date": str(datetime.now())}
-    f = open(file, "w")
-    f.write(json.dumps(applications))
-    f.close()
+    with open(file, "w", encoding="utf-8") as store:
+        json.dump(applications, store, indent=2)
     return app_id
 
-def loadApplications(file="loans.json"):
-    global applications
-    f = open(file, "r")
-    applications = json.loads(f.read())
-    f.close()
+def upload_to_bureau(report_path):
+    """Upload a report to the credit bureau over HTTPS.
 
-def uploadToBureau(report_path):
+    Credentials come from the BUREAU_USER and BUREAU_PASSWORD environment variables.
+    """
     user = os.environ["BUREAU_USER"]
     password = os.environ["BUREAU_PASSWORD"]
     token = base64.b64encode((user + ":" + password).encode()).decode()
+    with open(report_path, "rb") as report:
+        body = report.read()
     conn = http.client.HTTPSConnection(BUREAU_HOST, timeout=30)
-    conn.request("PUT", "/reports/" + os.path.basename(report_path), open(report_path, "rb").read(), {"Authorization": "Basic " + token})
-    conn.getresponse()
-    conn.close()
+    try:
+        conn.request("PUT", "/reports/" + os.path.basename(report_path), body,
+                     {"Authorization": "Basic " + token})
+        response = conn.getresponse()
+        if response.status >= 300:
+            raise ConnectionError(f"Bureau upload failed: {response.status} {response.reason}")
+    finally:
+        conn.close()
 
-def notifyApplicant(email, status):
+def notify_applicant(email, status):
+    """Email the applicant their loan status through the SMTP_HOST relay."""
     msg = EmailMessage()
     msg["Subject"] = "Loan " + status
     msg["From"] = os.environ.get("SMTP_SENDER", "loans@bank.example")
     msg["To"] = email
     msg.set_content("Your loan application status: " + status)
-    smtp = smtplib.SMTP(os.environ.get("SMTP_HOST", "localhost"), 587, timeout=30)
-    smtp.starttls()
-    smtp.send_message(msg)
-    smtp.quit()
+    with smtplib.SMTP(os.environ.get("SMTP_HOST", "localhost"), 587, timeout=30) as smtp:
+        smtp.starttls()
+        smtp.send_message(msg)
 
-def interestSaved(principal, annual_rate, years, prepayment):
-    original = calculateEMI(principal, annual_rate, years) * years * 12
-    reduced = calculateEMI(principal - prepayment, annual_rate, years) * years * 12
-    return (original - reduced)
+def interest_saved(principal, annual_rate, years, prepayment):
+    """Return the interest saved by prepaying part of the principal up front."""
+    original = calculate_emi(principal, annual_rate, years) * years * 12
+    reduced = calculate_emi(principal - prepayment, annual_rate, years) * years * 12
+    return original - reduced
 
-def riskBand(credit_score):
+def risk_band(credit_score):
+    """Map a credit score to a risk band."""
     if credit_score >= 800:
         return "LOW"
-    elif credit_score >= 700:
+    if credit_score >= 700:
         return "MEDIUM"
-    elif credit_score >= 600:
+    if credit_score >= 600:
         return "HIGH"
-    elif credit_score >= 300:
+    if credit_score >= 300:
         return "VERY HIGH"
-    else:
-        return "INVALID"
+    return "INVALID"
 
 def main():
-    print("EMI for 5L @ 9% for 5 years:", calculateEMI(500000, 9, 5))
-    print("Eligible (score 760, income 15000, EMIs 12000):", checkEligibility(35, 15000, 760, 12000, "personal"))
-    print("Eligible (unknown loan type 'crypto'):", checkEligibility(30, 80000, 650, 0, "crypto"))
-    print("Max loan for income 40000:", maxLoanAmount(40000, 5000, 0.09, 5))
-    print("Last schedule row:", amortisationSchedule(100000, 0.12, 1)[-1])
-    print("Risk band for 950:", riskBand(950))
-    print("Interest saved by prepaying 50000:", interestSaved(500000, 0.09, 5, 50000))
-    print("Saved as:", saveApplication("Anil", 500000))
-    loadApplications()
-    print("Applications on file:", len(applications))
-    print(f"Upload to bureau skipped (no network)")
+    """Run a short demo of the calculator."""
+    print("EMI for 5L @ 9% for 5 years:", calculate_emi(500000, 9, 5))
+    print("Eligible (score 760, income 15000, EMIs 12000):",
+          check_eligibility(35, 15000, 760, 12000, "personal"))
+    print("Eligible (unknown loan type 'crypto'):", check_eligibility(30, 80000, 650, 0, "crypto"))
+    print("Max loan for income 40000:", max_loan_amount(40000, 5000, 0.09, 5))
+    print("Last schedule row:", amortisation_schedule(100000, 0.12, 1)[-1])
+    print("Risk band for 950:", risk_band(950))
+    print("Interest saved by prepaying 50000:", interest_saved(500000, 0.09, 5, 50000))
+    print("Saved as:", save_application("Anil", 500000))
+    print("Applications on file:", len(load_applications()))
+    print("Upload to bureau skipped (no network)")
 
-main()
+if __name__ == "__main__":
+    main()
